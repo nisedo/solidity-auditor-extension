@@ -16,7 +16,7 @@ This extension bundles a focused set of features that are useful during manual s
   - shows which entry points can modify each variable
 - `Marked Files` view:
   - mark and unmark files
-  - mark and unmark folders
+  - toggle all files inside a folder from the folder context menu
   - auto-load marks from `SCOPE.md`
   - show marked files with a `📌` Explorer decoration
 - Diagnostics:
@@ -31,26 +31,9 @@ This extension bundles a focused set of features that are useful during manual s
 
 ## Install
 
-### Local VSIX
-
-Build and package:
-
 ```bash
-npm install
-npm run compile
-npx @vscode/vsce package
+git clone https://github.com/nisedo/solidity-auditor-extension.git && cd solidity-auditor-extension && npm install && npx @vscode/vsce package && code --install-extension solidity-auditor-extension-0.0.1.vsix
 ```
-
-Install the generated `.vsix` in VS Code or Cursor.
-
-### Development
-
-```bash
-npm install
-npm run compile
-```
-
-Then press `F5` in VS Code to launch an Extension Development Host.
 
 ## Usage
 
@@ -59,7 +42,7 @@ Then press `F5` in VS Code to launch an Extension Development Host.
   - `Cockpit`
   - `Variables`
   - `Marked Files`
-- Use the Explorer context menu to toggle marks on files and folders.
+- Use the Explorer context menu to toggle marks on files, or to toggle all files inside a folder.
 - Keep a `SCOPE.md` in the workspace if you want marks to auto-load on activation.
 
 ## Notes
@@ -73,7 +56,3 @@ Then press `F5` in VS Code to launch an Extension Development Host.
 - Diagnostics and hints are source-based, not compiler-accurate.
 - Unused private function detection is conservative around overloads.
 - Inlay hints only appear when the callee or struct definition can be resolved from locally available source.
-
-## Repository
-
-- Source: [github.com/nisedo/solidity-auditor-extension](https://github.com/nisedo/solidity-auditor-extension)

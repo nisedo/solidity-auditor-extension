@@ -155,7 +155,7 @@ export async function analyzeActiveContract(
     return {
       name: item.name,
       label: item.label,
-      detail: `${item.visibility} ${item.stateMutability} | ${item.contractName}${item.inherited ? ' (inherited)' : ''} | ${modifies.size} state vars`,
+      detail: `${item.visibility} ${item.stateMutability} | ${item.contractName}${item.inherited ? ' (inherited)' : ''} | may modify ${modifies.size} state var${modifies.size === 1 ? '' : 's'}`,
       contractName: item.contractName,
       inherited: item.inherited,
       location: toLocation(item.uri, item.location)

@@ -21,11 +21,8 @@ export class MarkManager implements vscode.TreeDataProvider<MarkedEntry>, vscode
   private readonly scopeWatcher: vscode.FileSystemWatcher;
 
   private manualFiles = new Set<string>();
-  private manualFolders = new Set<string>();
   private excludedFiles = new Set<string>();
-  private excludedFolders = new Set<string>();
   private scopeFiles = new Set<string>();
-  private scopeFolders = new Set<string>();
 
   readonly onDidChangeTreeData = this.treeEmitter.event;
   readonly onDidChangeFileDecorations = this.decorationEmitter.event;
@@ -39,9 +36,11 @@ export class MarkManager implements vscode.TreeDataProvider<MarkedEntry>, vscode
 
   async initialize(): Promise<void> {
     this.manualFiles = new Set(this.context.workspaceState.get<string[]>(STORAGE_KEYS.manualFiles, []));
-    this.manualFolders = new Set(this.context.workspaceState.get<string[]>(STORAGE_KEYS.manualFolders, []));
     this.excludedFiles = new Set(this.context.workspaceState.get<string[]>(STORAGE_KEYS.excludedFiles, []));
-    this.excludedFolders = new Set(this.context.workspaceState.get<string[]>(STORAGE_KEYS.excludedFolders, []));
+    await this.migrateLegacyFolderMarks(
+      new Set(this.context.workspaceState.get<string[]>(STORAGE_KEYS.manualFolders, [])),
+      new Set(this.context.workspaceState.get<string[]>(STORAGE_KEYS.excludedFolders, []))
+    );
     await this.reloadScopeMarks();
   }
 
@@ -52,22 +51,15 @@ export class MarkManager implements vscode.TreeDataProvider<MarkedEntry>, vscode
   }
 
   getTreeItem(entry: MarkedEntry): vscode.TreeItem {
-    const item = new vscode.TreeItem(entry.uri, entry.kind === 'folder' ? vscode.TreeItemCollapsibleState.None : vscode.TreeItemCollapsibleState.None);
+    const item = new vscode.TreeItem(entry.uri, vscode.TreeItemCollapsibleState.None);
     item.description = entry.source;
-    item.contextValue = entry.kind === 'folder' ? 'markedFolder' : 'markedFile';
+    item.contextValue = 'markedFile';
     item.resourceUri = entry.uri;
-    item.command =
-      entry.kind === 'folder'
-        ? {
-            command: 'revealInExplorer',
-            title: 'Reveal In Explorer',
-            arguments: [entry.uri]
-          }
-        : {
-            command: 'vscode.open',
-            title: 'Open File',
-            arguments: [entry.uri]
-          };
+    item.command = {
+      command: 'vscode.open',
+      title: 'Open File',
+      arguments: [entry.uri]
+    };
     return item;
   }
 
@@ -92,16 +84,7 @@ export class MarkManager implements vscode.TreeDataProvider<MarkedEntry>, vscode
     if (this.excludedFiles.has(key)) {
       return false;
     }
-    if (isWithinFolderSet(key, this.excludedFolders)) {
-      return false;
-    }
-    if (isWithinFolderSet(key, this.manualFolders)) {
-      return true;
-    }
     if (this.scopeFiles.has(key)) {
-      return true;
-    }
-    if (isWithinFolderSet(key, this.scopeFolders)) {
       return true;
     }
     return false;
@@ -121,29 +104,32 @@ export class MarkManager implements vscode.TreeDataProvider<MarkedEntry>, vscode
   }
 
   async toggleFolder(uri: vscode.Uri): Promise<void> {
-    const key = this.toKey(uri);
-    if (this.isMarked(uri)) {
-      this.manualFolders.delete(key);
-      this.excludedFolders.add(key);
-    } else {
-      this.manualFolders.add(key);
-      this.excludedFolders.delete(key);
+    const files = await listFilesRecursively(uri);
+    if (files.length === 0) {
+      return;
+    }
+
+    const allMarked = files.every((fileUri) => this.isMarked(fileUri));
+    for (const fileUri of files) {
+      const key = this.toKey(fileUri);
+      if (allMarked) {
+        this.manualFiles.delete(key);
+        this.excludedFiles.add(key);
+      } else {
+        this.manualFiles.add(key);
+        this.excludedFiles.delete(key);
+      }
     }
     await this.persist();
-    this.refresh(uri);
+    this.refresh(files);
   }
 
   async toggleEntry(entry: MarkedEntry): Promise<void> {
-    if (entry.kind === 'folder') {
-      await this.toggleFolder(entry.uri);
-      return;
-    }
     await this.toggleFile(entry.uri);
   }
 
   async reloadScopeMarks(): Promise<void> {
     const scopeFiles = new Set<string>();
-    const scopeFolders = new Set<string>();
 
     const scopeUris = await vscode.workspace.findFiles('**/SCOPE.md', '**/node_modules/**');
     for (const scopeUri of scopeUris) {
@@ -157,7 +143,9 @@ export class MarkManager implements vscode.TreeDataProvider<MarkedEntry>, vscode
 
         const key = this.toKey(resolved.uri);
         if (resolved.kind === 'folder') {
-          scopeFolders.add(key);
+          for (const fileUri of await listFilesRecursively(resolved.uri)) {
+            scopeFiles.add(this.toKey(fileUri));
+          }
         } else {
           scopeFiles.add(key);
         }
@@ -165,41 +153,19 @@ export class MarkManager implements vscode.TreeDataProvider<MarkedEntry>, vscode
     }
 
     this.scopeFiles = scopeFiles;
-    this.scopeFolders = scopeFolders;
     this.refresh();
   }
 
   private getEntries(): MarkedEntry[] {
     const entries = new Map<string, MarkedEntry>();
 
-    for (const key of this.scopeFolders) {
-      if (this.excludedFolders.has(key)) {
-        continue;
-      }
-      entries.set(`folder:${key}`, {
-        kind: 'folder',
-        source: 'scope',
-        key,
-        uri: this.toUri(key)
-      });
-    }
-
     for (const key of this.scopeFiles) {
-      if (this.excludedFiles.has(key) || isWithinFolderSet(key, this.excludedFolders)) {
+      if (this.excludedFiles.has(key)) {
         continue;
       }
       entries.set(`file:${key}`, {
         kind: 'file',
         source: 'scope',
-        key,
-        uri: this.toUri(key)
-      });
-    }
-
-    for (const key of this.manualFolders) {
-      entries.set(`folder:${key}`, {
-        kind: 'folder',
-        source: 'manual',
         key,
         uri: this.toUri(key)
       });
@@ -232,25 +198,38 @@ export class MarkManager implements vscode.TreeDataProvider<MarkedEntry>, vscode
   private async persist(): Promise<void> {
     await Promise.all([
       this.context.workspaceState.update(STORAGE_KEYS.manualFiles, Array.from(this.manualFiles)),
-      this.context.workspaceState.update(STORAGE_KEYS.manualFolders, Array.from(this.manualFolders)),
       this.context.workspaceState.update(STORAGE_KEYS.excludedFiles, Array.from(this.excludedFiles)),
-      this.context.workspaceState.update(STORAGE_KEYS.excludedFolders, Array.from(this.excludedFolders))
+      this.context.workspaceState.update(STORAGE_KEYS.manualFolders, []),
+      this.context.workspaceState.update(STORAGE_KEYS.excludedFolders, [])
     ]);
   }
 
-  private refresh(uri?: vscode.Uri): void {
+  private async migrateLegacyFolderMarks(manualFolders: Set<string>, excludedFolders: Set<string>): Promise<void> {
+    if (manualFolders.size === 0 && excludedFolders.size === 0) {
+      return;
+    }
+
+    for (const folderKey of manualFolders) {
+      for (const fileUri of await listFilesRecursively(this.toUri(folderKey))) {
+        this.manualFiles.add(this.toKey(fileUri));
+      }
+    }
+
+    for (const folderKey of excludedFolders) {
+      for (const fileUri of await listFilesRecursively(this.toUri(folderKey))) {
+        const key = this.toKey(fileUri);
+        this.manualFiles.delete(key);
+        this.excludedFiles.add(key);
+      }
+    }
+
+    await this.persist();
+  }
+
+  private refresh(uri?: vscode.Uri | vscode.Uri[]): void {
     this.treeEmitter.fire();
     this.decorationEmitter.fire(uri);
   }
-}
-
-function isWithinFolderSet(target: string, folders: Set<string>): boolean {
-  for (const folder of folders) {
-    if (target === folder || target.startsWith(`${folder}/`)) {
-      return true;
-    }
-  }
-  return false;
 }
 
 function normalizeKey(value: string): string {
@@ -310,4 +289,31 @@ async function resolveScopeCandidate(
   }
 
   return undefined;
+}
+
+async function listFilesRecursively(uri: vscode.Uri): Promise<vscode.Uri[]> {
+  const files: vscode.Uri[] = [];
+
+  const visit = async (current: vscode.Uri): Promise<void> => {
+    let entries: [string, vscode.FileType][];
+    try {
+      entries = await vscode.workspace.fs.readDirectory(current);
+    } catch {
+      return;
+    }
+
+    for (const [name, type] of entries) {
+      const child = vscode.Uri.file(path.join(current.fsPath, name));
+      if ((type & vscode.FileType.Directory) !== 0) {
+        await visit(child);
+        continue;
+      }
+      if ((type & vscode.FileType.File) !== 0) {
+        files.push(child);
+      }
+    }
+  };
+
+  await visit(uri);
+  return files;
 }

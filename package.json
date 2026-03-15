@@ -1,0 +1,120 @@
+{
+  "name": "solidity-auditor-extension",
+  "displayName": "Solidity Auditor Extension",
+  "description": "Minimal Solidity audit helpers for cockpit, variables, inlay hints, marks, and diagnostics.",
+  "version": "0.0.1",
+  "publisher": "nisedo",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/nisedo/solidity-auditor-extension.git"
+  },
+  "bugs": {
+    "url": "https://github.com/nisedo/solidity-auditor-extension/issues"
+  },
+  "homepage": "https://github.com/nisedo/solidity-auditor-extension#readme",
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onLanguage:solidity",
+    "onView:solidityAuditor.cockpit",
+    "onView:solidityAuditor.variables",
+    "onView:solidityAuditor.marked"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "solidityAuditor",
+          "title": "Solidity Auditor",
+          "icon": "media/solidity-auditor.svg"
+        }
+      ]
+    },
+    "languages": [
+      {
+        "id": "solidity",
+        "aliases": [
+          "Solidity",
+          "solidity"
+        ],
+        "extensions": [
+          ".sol"
+        ]
+      }
+    ],
+    "views": {
+      "solidityAuditor": [
+        {
+          "id": "solidityAuditor.cockpit",
+          "name": "Cockpit"
+        },
+        {
+          "id": "solidityAuditor.variables",
+          "name": "Variables"
+        },
+        {
+          "id": "solidityAuditor.marked",
+          "name": "Marked Files"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "solidityAuditor.toggleMarkFile",
+        "title": "Solidity Auditor: Toggle Mark File"
+      },
+      {
+        "command": "solidityAuditor.toggleMarkFolder",
+        "title": "Solidity Auditor: Toggle Mark Folder"
+      },
+      {
+        "command": "solidityAuditor.toggleMarkedItem",
+        "title": "Solidity Auditor: Toggle Marked Item"
+      },
+      {
+        "command": "solidityAuditor.reloadScope",
+        "title": "Solidity Auditor: Reload Marks From SCOPE.md"
+      }
+    ],
+    "menus": {
+      "explorer/context": [
+        {
+          "command": "solidityAuditor.toggleMarkFile",
+          "when": "!explorerResourceIsFolder",
+          "group": "navigation@10"
+        },
+        {
+          "command": "solidityAuditor.toggleMarkFolder",
+          "when": "explorerResourceIsFolder",
+          "group": "navigation@10"
+        }
+      ],
+      "view/item/context": [
+        {
+          "command": "solidityAuditor.toggleMarkedItem",
+          "when": "view == solidityAuditor.marked && viewItem =~ /^marked/",
+          "group": "navigation"
+        }
+      ]
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "vscode:prepublish": "npm run compile"
+  },
+  "dependencies": {
+    "@solidity-parser/parser": "^0.20.2"
+  },
+  "devDependencies": {
+    "@types/node": "^20.12.12",
+    "@types/vscode": "^1.90.0",
+    "typescript": "^5.4.5",
+    "vscode": "^1.1.37"
+  }
+}

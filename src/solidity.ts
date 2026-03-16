@@ -200,6 +200,15 @@ export async function provideInlayHints(
   const seenHintKeys = new Set<string>();
   const excludedRanges = findExcludedTextRanges(document, range);
   const constantMapCache = new Map<string, Map<string, StateVariableInfo>>();
+  const getConstantMap = (contract: ContractInfo): Map<string, StateVariableInfo> => {
+    let constantMap = constantMapCache.get(contract.name);
+    if (!constantMap) {
+      constantMap = buildConstantMap(contract, contractMap);
+      constantMapCache.set(contract.name, constantMap);
+    }
+    return constantMap;
+  };
+
   walk(currentFile.ast, (node) => {
     if (node.type === 'Identifier' && node.name && node.loc) {
       if (excludedRanges.some((excludedRange) => rangesIntersect(toDocumentRange(document, node), excludedRange))) {
@@ -212,12 +221,7 @@ export async function provideInlayHints(
         return;
       }
 
-      let constantMap = constantMapCache.get(currentContract.name);
-      if (!constantMap) {
-        constantMap = buildConstantMap(currentContract, contractMap);
-        constantMapCache.set(currentContract.name, constantMap);
-      }
-
+      const constantMap = getConstantMap(currentContract);
       const constantInfo = constantMap.get(node.name);
       if (!constantInfo?.constantValueText) {
         return;
@@ -227,6 +231,32 @@ export async function provideInlayHints(
         constantInfo.uri.toString() === document.uri.toString() &&
         sameRange(node.range, constantInfo.nameRange)
       ) {
+        return;
+      }
+
+      pushInlayHint(
+        hints,
+        seenHintKeys,
+        toDocumentRange(document, node).end,
+        `: ${constantInfo.constantValueText}`,
+        vscode.InlayHintKind.Parameter
+      );
+      return;
+    }
+
+    if (node.type === 'MemberAccess' && node.loc) {
+      if (excludedRanges.some((excludedRange) => rangesIntersect(toDocumentRange(document, node), excludedRange))) {
+        return;
+      }
+
+      const memberPosition = new vscode.Position(node.loc.start.line - 1, node.loc.start.column);
+      const currentContract = findActiveContract(currentFile.contracts, memberPosition);
+      if (!currentContract) {
+        return;
+      }
+
+      const constantInfo = resolveQualifiedConstant(node, currentFile, contractMap, getConstantMap);
+      if (!constantInfo?.constantValueText) {
         return;
       }
 
@@ -703,6 +733,49 @@ function buildConstantMap(currentContract: ContractInfo, contractsByName: Map<st
   }
 
   return expandedConstants;
+}
+
+function resolveQualifiedConstant(
+  expression: any,
+  currentFile: ParsedFile,
+  contractsByName: Map<string, ContractInfo>,
+  getConstantMap: (contract: ContractInfo) => Map<string, StateVariableInfo>
+): StateVariableInfo | undefined {
+  if (expression?.type !== 'MemberAccess' || expression.expression?.type !== 'Identifier') {
+    return undefined;
+  }
+
+  const ownerName = resolveImportedContractName(currentFile, expression.expression.name, contractsByName);
+  if (!ownerName) {
+    return undefined;
+  }
+
+  const ownerContract = contractsByName.get(ownerName);
+  if (!ownerContract) {
+    return undefined;
+  }
+
+  return getConstantMap(ownerContract).get(expression.memberName);
+}
+
+function resolveImportedContractName(
+  currentFile: ParsedFile,
+  localName: string,
+  contractsByName: Map<string, ContractInfo>
+): string | undefined {
+  if (contractsByName.has(localName)) {
+    return localName;
+  }
+
+  for (const imported of currentFile.imports) {
+    for (const alias of imported.symbolAliases) {
+      if (alias.local === localName && contractsByName.has(alias.foreign)) {
+        return alias.foreign;
+      }
+    }
+  }
+
+  return undefined;
 }
 
 function expandConstantValueText(

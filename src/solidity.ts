@@ -197,6 +197,7 @@ export async function provideInlayHints(
   }
 
   const hints: vscode.InlayHint[] = [];
+  const seenHintKeys = new Set<string>();
   const excludedRanges = findExcludedTextRanges(document, range);
   const constantMapCache = new Map<string, Map<string, StateVariableInfo>>();
   walk(currentFile.ast, (node) => {
@@ -229,12 +230,13 @@ export async function provideInlayHints(
         return;
       }
 
-      const hint = new vscode.InlayHint(
+      pushInlayHint(
+        hints,
+        seenHintKeys,
         toDocumentRange(document, node).end,
         `: ${constantInfo.constantValueText}`,
         vscode.InlayHintKind.Parameter
       );
-      hints.push(hint);
       return;
     }
 
@@ -275,13 +277,16 @@ export async function provideInlayHints(
         continue;
       }
 
-      const hint = new vscode.InlayHint(
+      pushInlayHint(
+        hints,
+        seenHintKeys,
         new vscode.Position(argument.loc.start.line - 1, argument.loc.start.column),
         `${parameter.name}:`,
-        vscode.InlayHintKind.Parameter
+        vscode.InlayHintKind.Parameter,
+        (hint) => {
+          hint.paddingRight = true;
+        }
       );
-      hint.paddingRight = true;
-      hints.push(hint);
     }
   });
 
@@ -687,7 +692,68 @@ function buildConstantMap(currentContract: ContractInfo, contractsByName: Map<st
       constants.set(variable.name, variable);
     }
   }
-  return constants;
+
+  const expandedConstants = new Map<string, StateVariableInfo>();
+  const memo = new Map<string, string>();
+  for (const [name, variable] of constants) {
+    expandedConstants.set(name, {
+      ...variable,
+      constantValueText: expandConstantValueText(name, constants, memo, new Set())
+    });
+  }
+
+  return expandedConstants;
+}
+
+function expandConstantValueText(
+  name: string,
+  constants: Map<string, StateVariableInfo>,
+  memo: Map<string, string>,
+  stack: Set<string>
+): string {
+  const cached = memo.get(name);
+  if (cached) {
+    return cached;
+  }
+
+  const variable = constants.get(name);
+  const rawText = variable?.constantValueText ?? name;
+  if (stack.has(name)) {
+    return rawText;
+  }
+
+  stack.add(name);
+  let expandedText = rawText;
+  for (const [otherName, otherVariable] of constants) {
+    if (otherName === name) {
+      continue;
+    }
+
+    const matcher = new RegExp(`\\b${escapeRegExp(otherName)}\\b`, 'g');
+    if (!matcher.test(expandedText)) {
+      continue;
+    }
+
+    const replacement = expandConstantValueText(otherName, constants, memo, stack);
+    expandedText = expandedText.replace(matcher, wrapConstantReplacement(replacement, otherVariable.constantValueText));
+  }
+
+  stack.delete(name);
+  memo.set(name, expandedText);
+  return expandedText;
+}
+
+function wrapConstantReplacement(replacement: string, rawText?: string): string {
+  const source = rawText ?? replacement;
+  if (/^[A-Za-z0-9_]+$/.test(source)) {
+    return replacement;
+  }
+
+  if (/^(?:0x[0-9a-fA-F]+|\d[\d_]*(?:e\d+)?|true|false|"[^"]*"|'[^']*')$/.test(source.trim())) {
+    return replacement;
+  }
+
+  return `(${replacement})`;
 }
 
 function buildTransitiveModificationMap(lineage: ContractInfo[]): Map<string, Set<string>> {
@@ -1344,6 +1410,25 @@ function toDocumentRange(document: vscode.TextDocument, node: any): vscode.Range
 
 function sameRange(left?: number[], right?: number[]): boolean {
   return Array.isArray(left) && Array.isArray(right) && left[0] === right[0] && left[1] === right[1];
+}
+
+function pushInlayHint(
+  hints: vscode.InlayHint[],
+  seenHintKeys: Set<string>,
+  position: vscode.Position,
+  label: string,
+  kind: vscode.InlayHintKind,
+  configure?: (hint: vscode.InlayHint) => void
+): void {
+  const key = `${position.line}:${position.character}:${kind}:${label}`;
+  if (seenHintKeys.has(key)) {
+    return;
+  }
+
+  seenHintKeys.add(key);
+  const hint = new vscode.InlayHint(position, label, kind);
+  configure?.(hint);
+  hints.push(hint);
 }
 
 function resolveLineage(contract: ContractInfo, contractsByName: Map<string, ContractInfo>): ContractInfo[] {

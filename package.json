@@ -51,7 +51,7 @@
       "solidityAuditor": [
         {
           "id": "solidityAuditor.cockpit",
-          "name": "Cockpit"
+          "name": "Tracker"
         },
         {
           "id": "solidityAuditor.variables",
@@ -79,6 +79,38 @@
       {
         "command": "solidityAuditor.reloadScope",
         "title": "Solidity Auditor: Reload Marks From SCOPE.md"
+      },
+      {
+        "command": "solidityAuditor.markEntryPointAudited",
+        "title": "Mark Entry Point Audited"
+      },
+      {
+        "command": "solidityAuditor.unmarkEntryPointAudited",
+        "title": "Unmark Entry Point Audited"
+      },
+      {
+        "command": "solidityAuditor.toggleMarkedEntryPointFilter",
+        "title": "Solidity Auditor: Toggle Marked Files Filter",
+        "icon": {
+          "light": "media/filter-light.svg",
+          "dark": "media/filter-dark.svg"
+        }
+      },
+      {
+        "command": "solidityAuditor.toggleTrackerUnauditedFilter",
+        "title": "Solidity Auditor: Toggle Tracker Unaudited Filter",
+        "icon": {
+          "light": "media/filter-light.svg",
+          "dark": "media/filter-dark.svg"
+        }
+      },
+      {
+        "command": "solidityAuditor.clearCachedAnalysisSnapshots",
+        "title": "Solidity Auditor: Clear Cached Analysis Snapshots"
+      },
+      {
+        "command": "solidityAuditor.showProgressReport",
+        "title": "Solidity Auditor: Show Progress Report"
       }
     ],
     "menus": {
@@ -94,10 +126,32 @@
           "group": "navigation@10"
         }
       ],
+      "view/title": [
+        {
+          "command": "solidityAuditor.toggleTrackerUnauditedFilter",
+          "when": "view == solidityAuditor.cockpit",
+          "group": "navigation"
+        },
+        {
+          "command": "solidityAuditor.toggleMarkedEntryPointFilter",
+          "when": "view == solidityAuditor.marked",
+          "group": "navigation"
+        }
+      ],
       "view/item/context": [
         {
           "command": "solidityAuditor.toggleMarkedItem",
           "when": "view == solidityAuditor.marked && viewItem =~ /^marked/",
+          "group": "navigation"
+        },
+        {
+          "command": "solidityAuditor.markEntryPointAudited",
+          "when": "view == solidityAuditor.cockpit && viewItem == trackedEntryPointUnaudited",
+          "group": "navigation"
+        },
+        {
+          "command": "solidityAuditor.unmarkEntryPointAudited",
+          "when": "view == solidityAuditor.cockpit && viewItem == trackedEntryPointAudited",
           "group": "navigation"
         }
       ]

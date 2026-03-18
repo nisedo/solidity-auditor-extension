@@ -1,12 +1,9 @@
 import * as path from 'node:path';
 import * as vscode from 'vscode';
+import { analyzeActiveContract, isSolidityDocument } from './solidity';
+import { PersistentStateManager } from './state';
 
-const STORAGE_KEYS = {
-  manualFiles: 'marked.manualFiles',
-  manualFolders: 'marked.manualFolders',
-  excludedFiles: 'marked.excludedFiles',
-  excludedFolders: 'marked.excludedFolders'
-};
+type MarkedFilterMode = 'all' | 'entrypoints';
 
 export interface MarkedEntry {
   kind: 'file' | 'folder';
@@ -19,15 +16,20 @@ export class MarkManager implements vscode.TreeDataProvider<MarkedEntry>, vscode
   private readonly treeEmitter = new vscode.EventEmitter<any>();
   private readonly decorationEmitter = new vscode.EventEmitter<vscode.Uri | vscode.Uri[] | undefined>();
   private readonly scopeWatcher: vscode.FileSystemWatcher;
+  private readonly entryPointProgressCache = new Map<string, { audited: number; total: number }>();
 
   private manualFiles = new Set<string>();
   private excludedFiles = new Set<string>();
   private scopeFiles = new Set<string>();
+  private filterMode: MarkedFilterMode = 'all';
 
   readonly onDidChangeTreeData = this.treeEmitter.event;
   readonly onDidChangeFileDecorations = this.decorationEmitter.event;
 
-  constructor(private readonly context: vscode.ExtensionContext) {
+  constructor(
+    private readonly context: vscode.ExtensionContext,
+    private readonly stateManager: PersistentStateManager
+  ) {
     this.scopeWatcher = vscode.workspace.createFileSystemWatcher('**/SCOPE.md');
     this.scopeWatcher.onDidChange(() => void this.reloadScopeMarks(), this, context.subscriptions);
     this.scopeWatcher.onDidCreate(() => void this.reloadScopeMarks(), this, context.subscriptions);
@@ -35,11 +37,13 @@ export class MarkManager implements vscode.TreeDataProvider<MarkedEntry>, vscode
   }
 
   async initialize(): Promise<void> {
-    this.manualFiles = new Set(this.context.workspaceState.get<string[]>(STORAGE_KEYS.manualFiles, []));
-    this.excludedFiles = new Set(this.context.workspaceState.get<string[]>(STORAGE_KEYS.excludedFiles, []));
+    const markedState = this.stateManager.getMarkedState();
+    this.manualFiles = new Set(markedState.manualFiles);
+    this.excludedFiles = new Set(markedState.excludedFiles);
+    this.filterMode = markedState.filterMode as MarkedFilterMode;
     await this.migrateLegacyFolderMarks(
-      new Set(this.context.workspaceState.get<string[]>(STORAGE_KEYS.manualFolders, [])),
-      new Set(this.context.workspaceState.get<string[]>(STORAGE_KEYS.excludedFolders, []))
+      new Set(markedState.legacyManualFolders),
+      new Set(markedState.legacyExcludedFolders)
     );
     await this.reloadScopeMarks();
   }
@@ -50,21 +54,61 @@ export class MarkManager implements vscode.TreeDataProvider<MarkedEntry>, vscode
     this.decorationEmitter.dispose();
   }
 
-  getTreeItem(entry: MarkedEntry): vscode.TreeItem {
+  async getTreeItem(entry: MarkedEntry): Promise<vscode.TreeItem> {
     const item = new vscode.TreeItem(entry.uri, vscode.TreeItemCollapsibleState.None);
-    item.description = entry.source;
+    const progress = await this.getEntryPointProgress(entry.uri);
+    item.description = progress === undefined
+      ? entry.source
+      : `${progress.audited}/${progress.total} audited`;
     item.contextValue = 'markedFile';
     item.resourceUri = entry.uri;
+    item.tooltip = progress === undefined
+      ? `${entry.uri.fsPath}\n${entry.source}`
+      : `${entry.uri.fsPath}\n${progress.audited}/${progress.total} audited | ${entry.source}`;
     item.command = {
-      command: 'vscode.open',
-      title: 'Open File',
-      arguments: [entry.uri]
+      command: 'solidityAuditor.openMarkedFile',
+      title: 'Open Marked File',
+      arguments: [entry]
     };
     return item;
   }
 
-  getChildren(): MarkedEntry[] {
-    return this.getEntries();
+  async getChildren(): Promise<MarkedEntry[]> {
+    return this.getEntries({ applyFilter: true });
+  }
+
+  getMarkedEntries(options?: { applyFilter?: boolean }): Promise<MarkedEntry[]> {
+    return this.getEntries({ applyFilter: options?.applyFilter ?? false });
+  }
+
+  isEntryPointFilterEnabled(): boolean {
+    return this.filterMode === 'entrypoints';
+  }
+
+  async toggleEntryPointFilter(): Promise<void> {
+    this.filterMode = this.filterMode === 'all' ? 'entrypoints' : 'all';
+    await this.persist();
+    this.refresh();
+  }
+
+  async clearCachedAnalysisSnapshots(): Promise<void> {
+    this.entryPointProgressCache.clear();
+    await this.stateManager.clearEntryPointSnapshots();
+    this.refresh();
+  }
+
+  refreshEntryPointCounts(uri?: vscode.Uri | vscode.Uri[]): void {
+    if (!uri) {
+      this.entryPointProgressCache.clear();
+    } else if (Array.isArray(uri)) {
+      for (const item of uri) {
+        this.entryPointProgressCache.delete(item.toString());
+      }
+    } else {
+      this.entryPointProgressCache.delete(uri.toString());
+    }
+
+    this.refresh(uri);
   }
 
   async provideFileDecoration(uri: vscode.Uri): Promise<vscode.FileDecoration | undefined> {
@@ -100,6 +144,7 @@ export class MarkManager implements vscode.TreeDataProvider<MarkedEntry>, vscode
       this.excludedFiles.delete(key);
     }
     await this.persist();
+    this.entryPointProgressCache.delete(uri.toString());
     this.refresh(uri);
   }
 
@@ -119,6 +164,7 @@ export class MarkManager implements vscode.TreeDataProvider<MarkedEntry>, vscode
         this.manualFiles.add(key);
         this.excludedFiles.delete(key);
       }
+      this.entryPointProgressCache.delete(fileUri.toString());
     }
     await this.persist();
     this.refresh(files);
@@ -153,10 +199,11 @@ export class MarkManager implements vscode.TreeDataProvider<MarkedEntry>, vscode
     }
 
     this.scopeFiles = scopeFiles;
+    this.entryPointProgressCache.clear();
     this.refresh();
   }
 
-  private getEntries(): MarkedEntry[] {
+  private async getEntries(options?: { applyFilter?: boolean }): Promise<MarkedEntry[]> {
     const entries = new Map<string, MarkedEntry>();
 
     for (const key of this.scopeFiles) {
@@ -180,7 +227,15 @@ export class MarkManager implements vscode.TreeDataProvider<MarkedEntry>, vscode
       });
     }
 
-    return Array.from(entries.values()).sort((left, right) => left.key.localeCompare(right.key));
+    const sortedEntries = Array.from(entries.values()).sort((left, right) => left.key.localeCompare(right.key));
+    if (!options?.applyFilter || this.filterMode === 'all') {
+      return sortedEntries;
+    }
+
+    const filteredEntries = await Promise.all(
+      sortedEntries.map(async (entry) => ((await this.getEntryPointProgress(entry.uri))?.total ?? 0) > 0 ? entry : undefined)
+    );
+    return filteredEntries.filter((entry): entry is MarkedEntry => Boolean(entry));
   }
 
   private toKey(uri: vscode.Uri): string {
@@ -196,12 +251,13 @@ export class MarkManager implements vscode.TreeDataProvider<MarkedEntry>, vscode
   }
 
   private async persist(): Promise<void> {
-    await Promise.all([
-      this.context.workspaceState.update(STORAGE_KEYS.manualFiles, Array.from(this.manualFiles)),
-      this.context.workspaceState.update(STORAGE_KEYS.excludedFiles, Array.from(this.excludedFiles)),
-      this.context.workspaceState.update(STORAGE_KEYS.manualFolders, []),
-      this.context.workspaceState.update(STORAGE_KEYS.excludedFolders, [])
-    ]);
+    await this.stateManager.setMarkedState({
+      manualFiles: Array.from(this.manualFiles),
+      excludedFiles: Array.from(this.excludedFiles),
+      filterMode: this.filterMode,
+      legacyManualFolders: [],
+      legacyExcludedFolders: []
+    });
   }
 
   private async migrateLegacyFolderMarks(manualFolders: Set<string>, excludedFolders: Set<string>): Promise<void> {
@@ -224,6 +280,87 @@ export class MarkManager implements vscode.TreeDataProvider<MarkedEntry>, vscode
     }
 
     await this.persist();
+  }
+
+  async getEntryPointProgress(uri: vscode.Uri): Promise<{ audited: number; total: number } | undefined> {
+    if (!uri.fsPath.endsWith('.sol')) {
+      return undefined;
+    }
+
+    const cacheKey = uri.toString();
+    const cached = this.entryPointProgressCache.get(cacheKey);
+    if (cached !== undefined) {
+      return cached;
+    }
+
+    const document = await vscode.workspace.openTextDocument(uri);
+    if (!isSolidityDocument(document)) {
+      return undefined;
+    }
+
+    const fileKey = this.toKey(uri);
+    const activeEditor = vscode.window.activeTextEditor;
+    const useActiveSelection = Boolean(activeEditor && activeEditor.document.uri.toString() === uri.toString());
+    if (!useActiveSelection) {
+      const snapshot = await this.getPersistedEntryPointSnapshot(uri, fileKey);
+      if (snapshot) {
+        const progress = this.buildEntryPointProgress(fileKey, snapshot.entryPointIds);
+        this.entryPointProgressCache.set(cacheKey, progress);
+        return progress;
+      }
+    }
+
+    const analysis = await analyzeActiveContract(
+      document,
+      useActiveSelection ? activeEditor!.selection.active : new vscode.Position(0, 0)
+    );
+    const entryPointIds = (analysis?.cockpitItems ?? []).map((entryPoint) => entryPoint.id);
+    const progress = this.buildEntryPointProgress(fileKey, entryPointIds);
+    this.entryPointProgressCache.set(cacheKey, progress);
+    await this.persistEntryPointSnapshot(uri, fileKey, entryPointIds);
+    return progress;
+  }
+
+  private buildEntryPointProgress(fileKey: string, entryPointIds: string[]): { audited: number; total: number } {
+    const trackedIds = new Set(this.stateManager.getTrackerState().auditedEntryIds);
+    return {
+      audited: entryPointIds.filter((entryPointId) => trackedIds.has(`${fileKey}::${entryPointId}`)).length,
+      total: entryPointIds.length
+    };
+  }
+
+  private async getPersistedEntryPointSnapshot(
+    uri: vscode.Uri,
+    fileKey: string
+  ): Promise<{ mtime: number; size: number; entryPointIds: string[] } | undefined> {
+    const snapshot = this.stateManager.getEntryPointSnapshot(fileKey);
+    if (!snapshot) {
+      return undefined;
+    }
+
+    try {
+      const stat = await vscode.workspace.fs.stat(uri);
+      if (stat.mtime !== snapshot.mtime || stat.size !== snapshot.size) {
+        return undefined;
+      }
+    } catch {
+      return undefined;
+    }
+
+    return snapshot;
+  }
+
+  private async persistEntryPointSnapshot(uri: vscode.Uri, fileKey: string, entryPointIds: string[]): Promise<void> {
+    try {
+      const stat = await vscode.workspace.fs.stat(uri);
+      await this.stateManager.setEntryPointSnapshot(fileKey, {
+        mtime: stat.mtime,
+        size: stat.size,
+        entryPointIds
+      });
+    } catch {
+      // Ignore cache persistence failures; live analysis result is already available.
+    }
   }
 
   private refresh(uri?: vscode.Uri | vscode.Uri[]): void {

@@ -4,9 +4,11 @@ import * as vscode from 'vscode';
 const parser = require('@solidity-parser/parser');
 
 export interface FunctionSummary {
+  id: string;
   name: string;
   label: string;
   detail: string;
+  tooltip?: string;
   contractName: string;
   inherited: boolean;
   location?: vscode.Location;
@@ -18,6 +20,7 @@ export interface VariableSummary {
   inherited: boolean;
   isConstant: boolean;
   isImmutable: boolean;
+  initializedInConstructor: boolean;
   location?: vscode.Location;
   modifiedBy: FunctionSummary[];
 }
@@ -32,6 +35,14 @@ export interface ContractAnalysis {
     constant: vscode.Range[];
     mutable: vscode.Range[];
   };
+}
+
+export interface TrackedEntryPointSummary {
+  id: string;
+  label: string;
+  contractName: string;
+  uri: vscode.Uri;
+  location?: vscode.Location;
 }
 
 interface ParsedImport {
@@ -55,6 +66,7 @@ interface ParsedFile {
   imports: ParsedImport[];
   contracts: ContractInfo[];
   topLevelStructs: StructInfo[];
+  topLevelErrors: NamedDefinitionInfo[];
   topLevelNames: string[];
 }
 
@@ -67,6 +79,8 @@ interface ContractInfo {
   usingLibraries: string[];
   stateVariables: StateVariableInfo[];
   structs: StructInfo[];
+  events: NamedDefinitionInfo[];
+  errors: NamedDefinitionInfo[];
   functions: FunctionInfo[];
 }
 
@@ -111,6 +125,13 @@ interface StructInfo {
   location?: SourceLocation;
 }
 
+interface NamedDefinitionInfo {
+  name: string;
+  parameters: ParameterInfo[];
+  uri: vscode.Uri;
+  location?: SourceLocation;
+}
+
 interface SourceLocation {
   start: {
     line: number;
@@ -150,12 +171,33 @@ export async function analyzeActiveContract(
   const lineage = resolveLineage(currentContract, contractMap);
   const publicFunctions = buildPublicFunctionList(currentContract, lineage);
   const transitiveModifies = buildTransitiveModificationMap(lineage);
+  const currentStateVariableNames = new Set(currentContract.stateVariables.map((variable) => variable.name));
   const cockpitItems = publicFunctions.map((item) => {
-    const modifies = transitiveModifies.get(item.id) ?? new Set<string>();
+    const mutabilityLabel = formatCockpitMutability(item.stateMutability);
+    const directModifiedNames = Array.from(item.directModifies).sort();
+    const transitiveModifiedNames = Array.from(transitiveModifies.get(item.id) ?? new Set<string>()).sort();
+    const localModifiedNames = transitiveModifiedNames.filter((name) => currentStateVariableNames.has(name));
+    const inheritedModifiedNames = transitiveModifiedNames.filter((name) => !currentStateVariableNames.has(name));
     return {
+      id: item.id,
       name: item.name,
       label: item.label,
-      detail: `${item.visibility} ${item.stateMutability} | ${item.contractName}${item.inherited ? ' (inherited)' : ''} | may modify ${modifies.size} state var${modifies.size === 1 ? '' : 's'}`,
+      detail: formatCockpitHeader(
+        mutabilityLabel,
+        item.contractName,
+        item.inherited,
+        `direct ${directModifiedNames.length} / transitive ${transitiveModifiedNames.length} | local ${localModifiedNames.length} / inherited ${inheritedModifiedNames.length}`
+      ),
+      tooltip: buildCockpitTooltip(
+        item.label,
+        mutabilityLabel,
+        item.contractName,
+        item.inherited,
+        directModifiedNames,
+        transitiveModifiedNames,
+        localModifiedNames,
+        inheritedModifiedNames
+      ),
       contractName: item.contractName,
       inherited: item.inherited,
       location: toLocation(item.uri, item.location)
@@ -164,7 +206,7 @@ export async function analyzeActiveContract(
 
   const variables = buildVariableList(currentContract, lineage, cockpitItems, publicFunctions, transitiveModifies);
   const diagnostics = buildDiagnostics(currentFile, filesByUri);
-  const decorations = buildSemanticDecorations(document, currentContract, lineage);
+  const decorations = buildSemanticDecorations(document, currentFile, currentContract, lineage);
 
   return {
     contractName: currentContract.name,
@@ -175,12 +217,44 @@ export async function analyzeActiveContract(
   };
 }
 
+export async function listTrackedEntryPoints(uri: vscode.Uri): Promise<TrackedEntryPointSummary[]> {
+  const document = await vscode.workspace.openTextDocument(uri);
+  if (!isSolidityDocument(document)) {
+    return [];
+  }
+
+  const { currentFile } = await loadDocumentContext(document);
+  return buildDeclaredEntryPointList(currentFile);
+}
+
 function buildDiagnostics(currentFile: ParsedFile, filesByUri: Map<string, ParsedFile>): vscode.Diagnostic[] {
   return [
     ...buildUnusedImportDiagnostics(currentFile, filesByUri),
     ...buildUnusedLocalVariableDiagnostics(currentFile.ast),
     ...buildUnusedPrivateFunctionDiagnostics(currentFile.ast)
   ];
+}
+
+function buildDeclaredEntryPointList(currentFile: ParsedFile): TrackedEntryPointSummary[] {
+  const items: TrackedEntryPointSummary[] = [];
+
+  for (const contract of currentFile.contracts) {
+    for (const fn of contract.functions) {
+      if (!isPublicStateChangingFunction(fn)) {
+        continue;
+      }
+
+      items.push({
+        id: fn.id,
+        label: fn.label,
+        contractName: contract.name,
+        uri: fn.uri,
+        location: toLocation(fn.uri, fn.location)
+      });
+    }
+  }
+
+  return items;
 }
 
 export async function provideInlayHints(
@@ -210,6 +284,47 @@ export async function provideInlayHints(
   };
 
   walk(currentFile.ast, (node) => {
+    if (node.type === 'EmitStatement' && node.eventCall?.loc) {
+      if (!rangesIntersect(toRange(node.loc), range)) {
+        return false;
+      }
+
+      const call = node.eventCall;
+      if ((call.names?.length ?? 0) === 0 && (call.identifiers?.length ?? 0) === 0 && (call.arguments?.length ?? 0) > 0) {
+        const callPosition = new vscode.Position(call.loc.start.line - 1, call.loc.start.column);
+        const currentContract = findActiveContract(currentFile.contracts, callPosition);
+        if (currentContract) {
+          const signature = resolveEventSignature(call.expression, (call.arguments ?? []).length, currentContract, contractMap);
+          addParameterNameHints(hints, seenHintKeys, signature?.parameters, call.arguments);
+        }
+      }
+
+      return false;
+    }
+
+    if (node.type === 'RevertStatement' && node.revertCall?.loc) {
+      if (!rangesIntersect(toRange(node.loc), range)) {
+        return false;
+      }
+
+      const call = node.revertCall;
+      if ((call.names?.length ?? 0) === 0 && (call.identifiers?.length ?? 0) === 0 && (call.arguments?.length ?? 0) > 0) {
+        const callPosition = new vscode.Position(call.loc.start.line - 1, call.loc.start.column);
+        const currentContract = findActiveContract(currentFile.contracts, callPosition) ?? currentFile.contracts[0];
+        const signature = resolveCustomErrorSignature(
+          call.expression,
+          (call.arguments ?? []).length,
+          currentFile,
+          currentContract,
+          contractMap,
+          allFiles
+        );
+        addParameterNameHints(hints, seenHintKeys, signature?.parameters, call.arguments);
+      }
+
+      return false;
+    }
+
     if (node.type === 'Identifier' && node.name && node.loc) {
       if (excludedRanges.some((excludedRange) => rangesIntersect(toDocumentRange(document, node), excludedRange))) {
         return;
@@ -296,28 +411,7 @@ export async function provideInlayHints(
     const enclosingFunction = findEnclosingFunction(currentContract.functions, callPosition);
     const signature = resolveCallSignature(node.expression, args.length, currentContract, contractMap, enclosingFunction);
     const parameters = signature?.parameters ?? resolveStructConstruction(node.expression, args.length, currentContract, contractMap, allFiles)?.fields;
-    if (!parameters) {
-      return;
-    }
-
-    for (let index = 0; index < Math.min(parameters.length, args.length); index++) {
-      const parameter = parameters[index];
-      const argument = args[index];
-      if (!parameter.name || !argument?.loc) {
-        continue;
-      }
-
-      pushInlayHint(
-        hints,
-        seenHintKeys,
-        new vscode.Position(argument.loc.start.line - 1, argument.loc.start.column),
-        `${parameter.name}:`,
-        vscode.InlayHintKind.Parameter,
-        (hint) => {
-          hint.paddingRight = true;
-        }
-      );
-    }
+    addParameterNameHints(hints, seenHintKeys, parameters, args);
   });
 
   return hints;
@@ -373,6 +467,7 @@ async function loadParsedFile(
         imports: [],
         contracts: [],
         topLevelStructs: [],
+        topLevelErrors: [],
         topLevelNames: []
       };
     }
@@ -380,8 +475,9 @@ async function loadParsedFile(
     const imports = extractImports(ast);
     const contracts = extractContracts(ast, uri, source);
     const topLevelStructs = extractTopLevelStructs(ast, uri);
+    const topLevelErrors = extractTopLevelErrors(ast, uri);
     const topLevelNames = extractTopLevelNames(ast);
-    const parsed: ParsedFile = { uri, ast, source, imports, contracts, topLevelStructs, topLevelNames };
+    const parsed: ParsedFile = { uri, ast, source, imports, contracts, topLevelStructs, topLevelErrors, topLevelNames };
 
     for (const entry of imports) {
       const resolvedUri = await resolveImportUri(uri, entry.path);
@@ -468,6 +564,17 @@ function extractTopLevelStructs(ast: any, uri: vscode.Uri): StructInfo[] {
   return structs;
 }
 
+function extractTopLevelErrors(ast: any, uri: vscode.Uri): NamedDefinitionInfo[] {
+  const errors: NamedDefinitionInfo[] = [];
+  for (const child of ast?.children ?? []) {
+    if (child?.type !== 'CustomErrorDefinition') {
+      continue;
+    }
+    errors.push(toNamedDefinitionInfo(child, uri));
+  }
+  return errors;
+}
+
 function extractContracts(ast: any, uri: vscode.Uri, source: string): ContractInfo[] {
   const contracts: ContractInfo[] = [];
   for (const child of ast?.children ?? []) {
@@ -482,6 +589,8 @@ function extractContracts(ast: any, uri: vscode.Uri, source: string): ContractIn
 
     const stateVariables: StateVariableInfo[] = [];
     const structs: StructInfo[] = [];
+    const events: NamedDefinitionInfo[] = [];
+    const errors: NamedDefinitionInfo[] = [];
     const functions: FunctionInfo[] = [];
     const usingLibraries = new Set<string>();
     for (const subNode of child.subNodes ?? []) {
@@ -519,6 +628,14 @@ function extractContracts(ast: any, uri: vscode.Uri, source: string): ContractIn
         });
       }
 
+      if (subNode?.type === 'EventDefinition') {
+        events.push(toNamedDefinitionInfo(subNode, uri));
+      }
+
+      if (subNode?.type === 'CustomErrorDefinition') {
+        errors.push(toNamedDefinitionInfo(subNode, uri));
+      }
+
       if (subNode?.type === 'FunctionDefinition') {
         const label = formatFunctionLabel(subNode);
         const name = getFunctionName(subNode);
@@ -552,6 +669,8 @@ function extractContracts(ast: any, uri: vscode.Uri, source: string): ContractIn
       usingLibraries: Array.from(usingLibraries),
       stateVariables,
       structs,
+      events,
+      errors,
       functions
     });
   }
@@ -575,6 +694,22 @@ function toStructInfo(node: any, uri: vscode.Uri): StructInfo {
     uri,
     location: node?.loc
   };
+}
+
+function toNamedDefinitionInfo(node: any, uri: vscode.Uri): NamedDefinitionInfo {
+  return {
+    name: normalizeName(node?.name) ?? 'Definition',
+    parameters: extractDefinitionParameters(node?.parameters),
+    uri,
+    location: node?.loc
+  };
+}
+
+function extractDefinitionParameters(parameters: any): ParameterInfo[] {
+  return getParameterArray(parameters).map((parameter: any) => ({
+    name: normalizeName(parameter?.name),
+    typeName: getNamedTypeName(parameter?.typeName)
+  }));
 }
 
 function getConstantValueText(source: string, variable: any): string | undefined {
@@ -671,6 +806,12 @@ function buildVariableList(
 ): VariableSummary[] {
   const seen = new Set<string>();
   const variables: VariableSummary[] = [];
+  const constructorModifiedNames = new Set(
+    lineage
+      .flatMap((contract) => contract.functions)
+      .filter((fn) => fn.name === 'constructor')
+      .flatMap((fn) => Array.from(transitiveModifies.get(fn.id) ?? fn.directModifies))
+  );
 
   for (const contract of lineage) {
     const inherited = contract.name !== currentContract.name;
@@ -688,6 +829,7 @@ function buildVariableList(
         .map((fn) => {
           const summary = cockpitItems.find((item) => item.label === fn.label && item.contractName === fn.contractName);
           return summary ?? {
+            id: fn.id,
             name: fn.name,
             label: fn.label,
             detail: `${fn.contractName}${fn.inherited ? ' (inherited)' : ''}`,
@@ -703,6 +845,7 @@ function buildVariableList(
         inherited,
         isConstant: variable.isConstant,
         isImmutable: variable.isImmutable,
+        initializedInConstructor: modifiedBy.length === 0 && constructorModifiedNames.has(variable.name),
         location: toLocation(variable.uri, variable.location),
         modifiedBy
       });
@@ -829,6 +972,141 @@ function wrapConstantReplacement(replacement: string, rawText?: string): string 
   return `(${replacement})`;
 }
 
+function resolveEventSignature(
+  expression: any,
+  argCount: number,
+  currentContract: ContractInfo,
+  contractsByName: Map<string, ContractInfo>
+): NamedDefinitionInfo | undefined {
+  if (expression?.type !== 'Identifier') {
+    return undefined;
+  }
+
+  const lineage = resolveLineage(currentContract, contractsByName);
+  return selectSingleNamedDefinition(findNamedDefinitionsByNameAndArity(lineage.flatMap((contract) => contract.events), expression.name, argCount));
+}
+
+function resolveCustomErrorSignature(
+  expression: any,
+  argCount: number,
+  currentFile: ParsedFile,
+  currentContract: ContractInfo | undefined,
+  contractsByName: Map<string, ContractInfo>,
+  allFiles: ParsedFile[]
+): NamedDefinitionInfo | undefined {
+  if (expression?.type === 'Identifier') {
+    const localMatches = currentContract
+      ? findNamedDefinitionsByNameAndArity(resolveLineage(currentContract, contractsByName).flatMap((contract) => contract.errors), expression.name, argCount)
+      : [];
+    if (localMatches.length === 1) {
+      return localMatches[0];
+    }
+
+    return selectSingleNamedDefinition(findNamedDefinitionsByNameAndArity(allFiles.flatMap((file) => file.topLevelErrors), expression.name, argCount));
+  }
+
+  if (expression?.type !== 'MemberAccess' || expression.expression?.type !== 'Identifier') {
+    return undefined;
+  }
+
+  const ownerName = resolveImportedContractName(currentFile, expression.expression.name, contractsByName);
+  if (!ownerName) {
+    return undefined;
+  }
+
+  const ownerContract = contractsByName.get(ownerName);
+  if (!ownerContract) {
+    return undefined;
+  }
+
+  return selectSingleNamedDefinition(
+    findNamedDefinitionsByNameAndArity(
+      resolveLineage(ownerContract, contractsByName).flatMap((contract) => contract.errors),
+      expression.memberName,
+      argCount
+    )
+  );
+}
+
+function addParameterNameHints(
+  hints: vscode.InlayHint[],
+  seenHintKeys: Set<string>,
+  parameters: ParameterInfo[] | undefined,
+  args: any[] = []
+): void {
+  if (!parameters) {
+    return;
+  }
+
+  for (let index = 0; index < Math.min(parameters.length, args.length); index++) {
+    const parameter = parameters[index];
+    const argument = args[index];
+    if (!parameter.name || !argument?.loc) {
+      continue;
+    }
+
+    pushInlayHint(
+      hints,
+      seenHintKeys,
+      new vscode.Position(argument.loc.start.line - 1, argument.loc.start.column),
+      `${parameter.name}:`,
+      vscode.InlayHintKind.Parameter,
+      (hint) => {
+        hint.paddingRight = true;
+      }
+    );
+  }
+}
+
+function findNamedDefinitionsByNameAndArity(
+  definitions: NamedDefinitionInfo[],
+  name: string,
+  argCount: number
+): NamedDefinitionInfo[] {
+  return definitions.filter((definition) => definition.name === name && definition.parameters.length === argCount);
+}
+
+function selectSingleNamedDefinition(matches: NamedDefinitionInfo[]): NamedDefinitionInfo | undefined {
+  if (matches.length !== 1) {
+    return undefined;
+  }
+  return matches[0];
+}
+
+function buildCockpitTooltip(
+  label: string,
+  mutabilityLabel: string,
+  contractName: string,
+  inherited: boolean,
+  directModifiedNames: string[],
+  transitiveModifiedNames: string[],
+  localModifiedNames: string[],
+  inheritedModifiedNames: string[]
+): string {
+  return [
+    label,
+    formatCockpitHeader(mutabilityLabel, contractName, inherited, ''),
+    `Direct: ${formatNameList(directModifiedNames)}`,
+    `Transitive: ${formatNameList(transitiveModifiedNames)}`,
+    `Local: ${formatNameList(localModifiedNames)}`,
+    `Inherited: ${formatNameList(inheritedModifiedNames)}`
+  ].join('\n');
+}
+
+function formatNameList(names: string[]): string {
+  return names.length > 0 ? names.join(', ') : 'none';
+}
+
+function formatCockpitMutability(stateMutability: string): string {
+  return stateMutability === 'nonpayable' ? '' : stateMutability;
+}
+
+function formatCockpitHeader(mutabilityLabel: string, contractName: string, inherited: boolean, suffix: string): string {
+  return [mutabilityLabel, `${contractName}${inherited ? ' (inherited)' : ''}`, suffix]
+    .filter((part) => part.length > 0)
+    .join(' | ');
+}
+
 function buildTransitiveModificationMap(lineage: ContractInfo[]): Map<string, Set<string>> {
   const byName = new Map<string, FunctionInfo[]>();
   const allFunctions = lineage.flatMap((contract) => contract.functions);
@@ -911,32 +1189,35 @@ function collectLocalNames(fn: any): Set<string> {
 
 function collectDirectModifications(body: any, localNames: Set<string>): Set<string> {
   const modified = new Set<string>();
+  const storageAliases = collectStorageAliases(body, (name) => !localNames.has(name));
+
+  const addModifiedRoots = (target: any) => {
+    for (const name of extractRootIdentifiers(target)) {
+      const resolvedName = storageAliases.get(name);
+      if (resolvedName) {
+        modified.add(resolvedName);
+        continue;
+      }
+
+      if (!localNames.has(name)) {
+        modified.add(name);
+      }
+    }
+  };
 
   walk(body, (node) => {
     if (node.type === 'Assignment' || isAssignmentLikeBinaryOperation(node)) {
-      for (const name of extractRootIdentifiers(node.left ?? node.leftHandSide)) {
-        if (!localNames.has(name)) {
-          modified.add(name);
-        }
-      }
+      addModifiedRoots(node.left ?? node.leftHandSide);
     }
 
     if (node.type === 'UnaryOperation' && ['++', '--', 'delete'].includes(node.operator)) {
-      for (const name of extractRootIdentifiers(node.subExpression)) {
-        if (!localNames.has(name)) {
-          modified.add(name);
-        }
-      }
+      addModifiedRoots(node.subExpression);
     }
 
     if (node.type === 'FunctionCall') {
       const expression = node.expression;
       if (expression?.type === 'MemberAccess' && ['push', 'pop'].includes(expression.memberName)) {
-        for (const name of extractRootIdentifiers(expression.expression)) {
-          if (!localNames.has(name)) {
-            modified.add(name);
-          }
-        }
+        addModifiedRoots(expression.expression);
       }
     }
   });
@@ -1328,6 +1609,7 @@ function collectUsedSymbols(ast: any): Set<string> {
 
 function buildSemanticDecorations(
   document: vscode.TextDocument,
+  currentFile: ParsedFile,
   currentContract: ContractInfo,
   lineage: ContractInfo[]
 ): { immutable: vscode.Range[]; constant: vscode.Range[]; mutable: vscode.Range[] } {
@@ -1370,11 +1652,238 @@ function buildSemanticDecorations(
     }
   }
 
+  const storageAccessorNames = collectStorageAccessorNames(currentFile.ast, currentContract);
+  const storageHighlightRanges = collectStorageHighlightRanges(
+    document,
+    currentFile,
+    currentContract,
+    mutableNames,
+    storageAccessorNames
+  );
+
   return {
     immutable: findWordRanges(document, contractRange, immutableNames, excludedRanges),
     constant: findWordRanges(document, contractRange, constantNames, excludedRanges),
-    mutable: findWordRanges(document, contractRange, mutableNames, excludedRanges)
+    mutable: mergeRanges(
+      findWordRanges(document, contractRange, mutableNames, excludedRanges),
+      storageHighlightRanges
+    )
   };
+}
+
+function collectStorageHighlightRanges(
+  document: vscode.TextDocument,
+  currentFile: ParsedFile,
+  currentContract: ContractInfo,
+  mutableNames: Set<string>,
+  storageAccessorNames: Set<string>
+): vscode.Range[] {
+  if (!currentContract.location || !currentFile.ast) {
+    return [];
+  }
+
+  const ranges: vscode.Range[] = [];
+  walk(currentFile.ast, (node) => {
+    if (!isExecutableDefinition(node) || !node.body || !node.loc) {
+      return;
+    }
+
+    const position = new vscode.Position(node.loc.start.line - 1, node.loc.start.column);
+    if (!locationContains(currentContract.location, position)) {
+      return false;
+    }
+
+    const storageAliases = collectStorageAliasNames(
+      node.body,
+      (name) => mutableNames.has(name),
+      storageAccessorNames
+    );
+    const bodyRange = toRange(node.body.loc);
+    const excludedRanges = findExcludedTextRanges(document, bodyRange);
+    ranges.push(...findWordRanges(document, bodyRange, storageAliases, excludedRanges));
+
+    walk(node.body, (bodyNode) => {
+      if (bodyNode.type !== 'MemberAccess' || !Array.isArray(bodyNode.range) || typeof bodyNode.memberName !== 'string') {
+        return;
+      }
+
+      const rootName = getRootIdentifierName(bodyNode.expression);
+      if (!rootName) {
+        return;
+      }
+
+      if (!mutableNames.has(rootName) && !storageAliases.has(rootName) && !storageAccessorNames.has(rootName)) {
+        return;
+      }
+
+      const range = toMemberNameRange(document, bodyNode);
+      if (range) {
+        ranges.push(range);
+      }
+    });
+
+    return false;
+  });
+
+  return ranges;
+}
+
+function collectStorageAccessorNames(ast: any, currentContract: ContractInfo): Set<string> {
+  const names = new Set<string>();
+  if (!currentContract.location || !ast) {
+    return names;
+  }
+
+  walk(ast, (node) => {
+    if (node?.type !== 'FunctionDefinition' || !node.loc) {
+      return;
+    }
+
+    const position = new vscode.Position(node.loc.start.line - 1, node.loc.start.column);
+    if (!locationContains(currentContract.location, position)) {
+      return;
+    }
+
+    const functionName = normalizeName(node.name);
+    if (!functionName) {
+      return false;
+    }
+
+    if (getParameterArray(node.returnParameters).some((parameter) => parameter?.storageLocation === 'storage')) {
+      names.add(functionName);
+    }
+
+    return false;
+  });
+
+  return names;
+}
+
+function collectStorageAliasNames(
+  body: any,
+  isStateBackedRootName: (name: string) => boolean,
+  storageAccessorNames: Set<string>
+): Set<string> {
+  const declarations: Array<{ alias: string; rootName?: string }> = [];
+
+  walk(body, (node) => {
+    if (node.type !== 'VariableDeclarationStatement') {
+      return;
+    }
+
+    for (const variable of node.variables ?? []) {
+      const alias = normalizeName(variable?.name);
+      if (!alias || variable?.storageLocation !== 'storage') {
+        continue;
+      }
+
+      declarations.push({
+        alias,
+        rootName: getRootIdentifierName(node.initialValue)
+      });
+    }
+  });
+
+  const aliases = new Set<string>();
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const declaration of declarations) {
+      if (aliases.has(declaration.alias) || !declaration.rootName) {
+        continue;
+      }
+
+      if (
+        isStateBackedRootName(declaration.rootName)
+        || storageAccessorNames.has(declaration.rootName)
+        || aliases.has(declaration.rootName)
+      ) {
+        aliases.add(declaration.alias);
+        changed = true;
+      }
+    }
+  }
+
+  return aliases;
+}
+
+function collectStorageAliases(body: any, isStateBackedRootName: (name: string) => boolean): Map<string, string> {
+  const declarations: Array<{ alias: string; rootName?: string }> = [];
+
+  walk(body, (node) => {
+    if (node.type !== 'VariableDeclarationStatement') {
+      return;
+    }
+
+    for (const variable of node.variables ?? []) {
+      const alias = normalizeName(variable?.name);
+      if (!alias || variable?.storageLocation !== 'storage') {
+        continue;
+      }
+
+      declarations.push({
+        alias,
+        rootName: getRootIdentifierName(node.initialValue)
+      });
+    }
+  });
+
+  const aliases = new Map<string, string>();
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const declaration of declarations) {
+      if (aliases.has(declaration.alias) || !declaration.rootName) {
+        continue;
+      }
+
+      if (isStateBackedRootName(declaration.rootName)) {
+        aliases.set(declaration.alias, declaration.rootName);
+        changed = true;
+        continue;
+      }
+
+      const resolved = aliases.get(declaration.rootName);
+      if (resolved) {
+        aliases.set(declaration.alias, resolved);
+        changed = true;
+      }
+    }
+  }
+
+  return aliases;
+}
+
+function getRootIdentifierName(node: any): string | undefined {
+  return extractRootIdentifiers(node)[0];
+}
+
+function toMemberNameRange(document: vscode.TextDocument, node: any): vscode.Range | undefined {
+  if (!Array.isArray(node?.range) || typeof node.memberName !== 'string') {
+    return undefined;
+  }
+
+  const startOffset = node.range[1] - node.memberName.length + 1;
+  const endOffset = node.range[1] + 1;
+  return toOffsetRange(document, startOffset, endOffset);
+}
+
+function mergeRanges(...rangeLists: vscode.Range[][]): vscode.Range[] {
+  const merged: vscode.Range[] = [];
+  const seen = new Set<string>();
+
+  for (const rangeList of rangeLists) {
+    for (const range of rangeList) {
+      const key = `${range.start.line}:${range.start.character}:${range.end.line}:${range.end.character}`;
+      if (seen.has(key)) {
+        continue;
+      }
+      seen.add(key);
+      merged.push(range);
+    }
+  }
+
+  return merged;
 }
 
 function findWordRanges(
